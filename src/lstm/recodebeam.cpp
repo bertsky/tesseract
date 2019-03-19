@@ -27,6 +27,7 @@
 #include <set>
 #include <tuple>
 #include <vector>
+#include <list>
 
 #include <algorithm>
 
@@ -40,7 +41,7 @@ const float RecodeBeamSearch::kMinCertainty = -20.0f;
 
 // The beam width at each code position.
 const int RecodeBeamSearch::kBeamWidths[RecodedCharID::kMaxCodeLen + 1] = {
-    5, 10, 16, 16, 16, 16, 16, 16, 16, 16,
+      5, 10, 16, 16, 16, 16, 16, 16, 16, 16,
 };
 
 const char* kNodeContNames[] = {"Anything", "OnlyDup", "NoDup"};
@@ -49,11 +50,13 @@ const char* kNodeContNames[] = {"Anything", "OnlyDup", "NoDup"};
 void RecodeNode::Print(int null_char, const UNICHARSET& unicharset,
                        int depth) const {
   if (code == null_char) {
-    tprintf("null_char");
+    tprintf("null_char         ");
   } else {
     tprintf("label=%d, uid=%d=%s", code, unichar_id,
             unicharset.debug_str(unichar_id).string());
   }
+  if (duplicate)
+    tprintf(" dup");
   tprintf(" score=%g, c=%g,%s%s%s perm=%d, hash=%lx", score, certainty,
           start_of_dawg ? " DawgStart" : "", start_of_word ? " Start" : "",
           end_of_word ? " End" : "", permuter, code_hash);
@@ -65,6 +68,43 @@ void RecodeNode::Print(int null_char, const UNICHARSET& unicharset,
   }
 }
 
+  // uses dawg struct without word boundaries,
+  // but exposes API for adding single-symbol edges and nodes
+  class Lattice : public Trie {
+  public:
+    Lattice(int unicharset_size, int debug_level)
+      : Trie(DAWG_TYPE_NUMBER, // instead of a distinct type
+             STRING(), // lang?
+             NO_PERM,
+             unicharset_size, debug_level) {
+    }
+    bool add_new_edge(NODE_REF begin, NODE_REF end, UNICHAR_ID unichar_id) {
+      return Trie::add_new_edge(begin, end, false, false, unichar_id);
+    }
+    NODE_REF new_node() {
+      return Trie::new_dawg_node();
+    }
+    EDGE_REF edge_char_of(NODE_REF begin, UNICHAR_ID unichar_id) {
+      return Trie::edge_char_of(begin, unichar_id, false);
+    }
+    EDGE_REF edge_char_of(NODE_REF begin, NODE_REF end, UNICHAR_ID unichar_id) {
+      EDGE_RECORD *edge_ptr;
+      EDGE_INDEX edge_index;
+      if (Trie::edge_char_of(begin, end, FORWARD_EDGE, false, unichar_id,
+                             &edge_ptr, &edge_index))
+        return Trie::make_edge_ref(begin, edge_index);
+      else
+        return NO_EDGE;
+    }
+    
+    // NODE_REF next_node(EDGE_REF)
+    // UNICHAR_ID edge_letter(EDGE_REF)
+    // void unichar_ids_of(NODE_REF, NodeChildVector*, bool)
+    void print_all(int max_num_edges) {
+      Trie::print_all("lattice contents", max_num_edges);
+    }
+  };
+  
 // Borrows the pointer, which is expected to survive until *this is deleted.
 RecodeBeamSearch::RecodeBeamSearch(const UnicharCompress& recoder,
                                    int null_char, bool simple_text, Dict* dict)
@@ -95,7 +135,133 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
       SaveMostCertainChoices(output.f(t), output.NumFeatures(), charset, t);
     }
   }
+  if (lstm_choice_mode == 3) {
+    bool debug = true;
+    //if (debug) DebugBeams(*charset);
+#define dprintf(...) if (debug) { tprintf(__VA_ARGS__); }
+    const RecodeBeam* last_beam = beam_[beam_size_ - 1];
+    // FIXME: store the score and coords, too!
+    //        (see ExtractPathAsUnicharIds for that
+    //         but also combine scores for joined paths)
+    // initialize result dawg:
+    Lattice lat(charset->size(), 1);
+    // initialize auxiliary data:
+    std::map<std::pair<uint64_t, int>, NODE_REF> hashes; // (prefix-hash,t) -> begin
+    std::map<std::tuple<NODE_REF, UNICHAR_ID, int>, NODE_REF> predecessors; // (end,char,t) -> begin
+    std::map<int, std::list<NODE_REF>> ranks; // t -> nodes beginning with same t (merely for graphviz rank)
+    // translate all beams into symbol dawg / print dot graph:
+    dprintf("\ntranslating beams to lattice\n");
+    printf("\n\ndigraph lattice {\n  rankdir=\"LR\";\n  dpi=300;\n");
+    printf("0 [label=\"\\N (t=0)\"];\n");
+    for (int c = 0; c < NC_COUNT; ++c) {
+      if (c == NC_ONLY_DUP) continue;
+      NodeContinuation cont = static_cast<NodeContinuation>(c);
+      int beam_index = BeamIndex(0, cont, 0);
+      int heap_size = last_beam->beams_[beam_index].size();
+      dprintf("translating symbols from beam %d width %d\n", beam_index, heap_size);
+      for (int h = 0; h < heap_size; ++h) {
+        const RecodeNode* node = &last_beam->beams_[beam_index].get(h).data;
+        int t_begin = 0; // timesteps along path, counting backwards
+        NODE_REF begin = 0; // complete heap of all beams meet in final node
+        // go back path of node until nullptr (depth-first):
+        do {
+          int t_end = t_begin;
+          NODE_REF end = begin;
+          bool is_delimited = false;
+          // crush CTC states:
+          while (node->prev != nullptr &&
+                 (node->duplicate || //node->prev->code == node->code
+                  node->code == null_char_)) {
+            if (node->code == null_char_) is_delimited = true;
+            node = node->prev;
+            --t_begin;
+          }
+          // the following constraint ensures that edges (including nulls) span more than 1 timestep
+          // this is merely a workaround against single-timestep hypotheses not delimited by nulls
+          // which are probably a deficiency of vanilla CTC (as opposed to Equal Spacing CTC etc)
+          // that cause "diplopia" in the result (duplicates in the decoded sequence),
+          // and are observed more likely on suboptimal paths and models
+          // (and thus unavoidable in a full lattice view)
+          if (!is_delimited && t_end <= t_begin + 2) {
+            dprintf("t %4d end %d, symbol %d=%s, t %d IGNORE\n", t_end, end,
+                    node->unichar_id, charset->debug_str(node->unichar_id).string(), t_begin);
+            node = node->prev;
+            --t_begin;
+            continue;
+          }
+          // add an edge for each RecodeNode (symbol/unichar_id),
+          //    ending at the current node,
+          //    beginning at a new node, unless there already exists
+          //       a node with that prefix and timestep (beam hash)
+          // but do not add an edge 
+          // if there already exists an edge with the same symbol,
+          //    ending at the current node,
+          //    beginning at the current timestep,
+          // i.e. if already seen that suffix (lattice pos).
+          // advance the current node to the edge's beginning,
+          // and decrease the current timesteps, respectively.
+          if (node->unichar_id != INVALID_UNICHAR_ID) {
+            std::pair<uint64_t, int> hash(node->prev == nullptr ? 0 : node->prev->code_hash, t_begin);
+            std::tuple<NODE_REF, UNICHAR_ID, int> pos(end, node->unichar_id, t_begin);
+            std::tuple<NODE_REF, UNICHAR_ID, int> pos2(end, node->unichar_id, t_begin-1); // ignore 1-off differences
+            dprintf("t %4d end %d, symbol %d=%s, hash %x, t %d", t_end, end, node->unichar_id,
+                    charset->debug_str(node->unichar_id).string(), hash.first, t_begin);
+            if (hashes.find(hash) != hashes.end()) {
+              // we have already seen this node
+              begin = hashes[hash];
+              dprintf(" begin %d OLD\n", begin);
+            } else if (predecessors.find(pos) != predecessors.end()) {
+              // join paths, despite different hashes
+              begin = predecessors[pos];
+              dprintf(" begin %d JOIN\n", begin);
+            } else if (predecessors.find(pos2) != predecessors.end()) {
+              // join paths, despite different hashes
+              begin = predecessors[pos2];
+              dprintf(" begin %d JOIN\n", begin);
+            } else {
+              // add node
+              begin = lat.new_node();
+              dprintf(" begin %d NEW\n", begin);
+              hashes[hash] = begin;
+              if (ranks.find(t_begin) != ranks.end())
+                ranks[t_begin].push_back(begin);
+              else
+                ranks[t_begin] = {begin};
+              printf("%d [label=\"\\N (t%d)\"];\n", begin, t_begin);
+            }
+            EDGE_REF edge = lat.edge_char_of(begin, end, node->unichar_id);
+            if (edge == NO_EDGE) {
+              if (!lat.add_new_edge(begin, end, node->unichar_id))
+                tprintf("Failed to add edge %d-%d [%d]\n", begin, end, node->unichar_id);
+              predecessors[pos] = begin;
+              printf("%d -> %d [label=\"\\\"%s%s\\\"\"];\n",
+                     begin, end,
+                     !strcmp(charset->id_to_unichar_ext(node->unichar_id), "\"") ||
+                     !strcmp(charset->id_to_unichar_ext(node->unichar_id), "\\") ?
+                     "\\" : "",
+                     charset->id_to_unichar_ext(node->unichar_id));
+            } else {
+              // FIXME: add to confidence of existing edge
+            }
+          }
+          node = node->prev;
+          --t_begin;
+        } while (node != nullptr);
+        dprintf("reached root at %d\n", begin);
+      }
+    }
+    for (auto t_it = ranks.begin(); t_it != ranks.end(); ++t_it) {
+      printf("{ rank=same; ");
+      for (auto node_it = t_it->second.begin(); node_it != t_it->second.end(); ++node_it)
+        printf("%d; ", *node_it);
+      printf("}\n");
+    }
+    printf("\n}\n");
+    // serialize, or convert to squisheddawg and return...
+    //lat.print_all(10);
+  }
 }
+ 
 void RecodeBeamSearch::Decode(const GENERIC_2D_ARRAY<float>& output,
                               double dict_ratio, double cert_offset,
                               double worst_dict_cert,

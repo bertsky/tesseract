@@ -343,7 +343,7 @@ STRING UNICHARSET::debug_str(UNICHAR_ID id) const {
   if (fragment) {
     return fragment->to_string();
   }
-  const char* str = id_to_unichar(id);
+  const char* str = id_to_unichar_ext(id);
   STRING result = debug_utf8_str(str);
   // Append a for lower alpha, A for upper alpha, and x if alpha but neither.
   if (get_isalpha(id)) {

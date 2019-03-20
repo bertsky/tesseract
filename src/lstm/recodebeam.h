@@ -362,6 +362,9 @@ class RecodeBeamSearch {
   // path and reversing it.
   void ExtractPath(const RecodeNode* node,
                    GenericVector<const RecodeNode*>* path) const;
+  // Helper backtracks through the lattice from the given node, 
+  // stopping at the next start of a character. Returns that node.
+  const RecodeNode* GetPrevStart(const RecodeNode* node, int* steps);
   // Helper prints debug information on the given lattice path.
   void DebugPath(const UNICHARSET* unicharset,
                  const GenericVector<const RecodeNode*>& path) const;

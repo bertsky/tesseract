@@ -41,7 +41,8 @@ const float RecodeBeamSearch::kMinCertainty = -20.0f;
 
 // The beam width at each code position.
 const int RecodeBeamSearch::kBeamWidths[RecodedCharID::kMaxCodeLen + 1] = {
-      5, 10, 16, 16, 16, 16, 16, 16, 16, 16,
+  //5, 10, 16, 16, 16, 16, 16, 16, 16, 16,
+  15, 10, 16, 16, 16, 16, 16, 16, 16, 16, // increased beam width for lattice output
 };
 
 const char* kNodeContNames[] = {"Anything", "OnlyDup", "NoDup"};
@@ -104,7 +105,7 @@ void RecodeNode::Print(int null_char, const UNICHARSET& unicharset,
       Trie::print_all("lattice contents", max_num_edges);
     }
   };
-  
+
 // Borrows the pointer, which is expected to survive until *this is deleted.
 RecodeBeamSearch::RecodeBeamSearch(const UnicharCompress& recoder,
                                    int null_char, bool simple_text, Dict* dict)
@@ -146,13 +147,13 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
     // initialize result dawg:
     Lattice lat(charset->size(), 1);
     // initialize auxiliary data:
-    std::map<std::pair<uint64_t, int>, NODE_REF> hashes; // (prefix-hash,t) -> begin
-    std::map<std::tuple<NODE_REF, UNICHAR_ID, int>, NODE_REF> predecessors; // (end,char,t) -> begin
-    std::map<int, std::list<NODE_REF>> ranks; // t -> nodes beginning with same t (merely for graphviz rank)
+    std::map<std::pair<uint64_t, int>, NODE_REF> hashes; // (prefix-hash,t_begin) -> begin
+    std::map<std::tuple<NODE_REF, UNICHAR_ID, int>, NODE_REF> predecessors; // (end,char,t_begin) -> begin
+    std::map<int, std::list<NODE_REF>> ranks; // t_begin -> begin* (merely for graphviz rank)
     // translate all beams into symbol dawg / print dot graph:
     dprintf("\ntranslating beams to lattice\n");
     printf("\n\ndigraph lattice {\n  rankdir=\"LR\";\n  dpi=300;\n");
-    printf("0 [label=\"\\N (t=0)\"];\n");
+    printf("0 [label=\"\\N (t=%d)\"];\n", beam_size_ - 1);
     for (int c = 0; c < NC_COUNT; ++c) {
       if (c == NC_ONLY_DUP) continue;
       NodeContinuation cont = static_cast<NodeContinuation>(c);
@@ -161,7 +162,7 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
       dprintf("translating symbols from beam %d width %d\n", beam_index, heap_size);
       for (int h = 0; h < heap_size; ++h) {
         const RecodeNode* node = &last_beam->beams_[beam_index].get(h).data;
-        int t_begin = 0; // timesteps along path, counting backwards
+        int t_begin = beam_size_ - 1; // timesteps along path, counting backwards
         NODE_REF begin = 0; // complete heap of all beams meet in final node
         // go back path of node until nullptr (depth-first):
         do {
@@ -176,11 +177,11 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
             node = node->prev;
             --t_begin;
           }
-          // the following constraint ensures that edges (including nulls) span more than 1 timestep
+          // the following constraint ensures that edges (including nulls) span more than 2 timesteps
           // this is merely a workaround against single-timestep hypotheses not delimited by nulls
           // which are probably a deficiency of vanilla CTC (as opposed to Equal Spacing CTC etc)
-          // that cause "diplopia" in the result (duplicates in the decoded sequence),
-          // and are observed more likely on suboptimal paths and models
+          // that cause "diplopia" in the result (duplicates in the decoded sequence without actual
+          // repetitions in the input), and are observed more likely on suboptimal paths and models
           // (and thus unavoidable in a full lattice view)
           if (!is_delimited && t_end <= t_begin + 2) {
             dprintf("t %4d end %d, symbol %d=%s, t %d IGNORE\n", t_end, end,
@@ -202,13 +203,29 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
           // and decrease the current timesteps, respectively.
           if (node->unichar_id != INVALID_UNICHAR_ID) {
             std::pair<uint64_t, int> hash(node->prev == nullptr ? 0 : node->prev->code_hash, t_begin);
+            std::pair<uint64_t, int> hash2(node->prev == nullptr ? 0 : node->prev->code_hash, t_begin-1); // ignore 1-off differences
             std::tuple<NODE_REF, UNICHAR_ID, int> pos(end, node->unichar_id, t_begin);
             std::tuple<NODE_REF, UNICHAR_ID, int> pos2(end, node->unichar_id, t_begin-1); // ignore 1-off differences
+            int t_begin_before;
+            {
+              const RecodeNode* node1 = GetPrevStart(node->prev, &t_begin_before);
+              if (node1->unichar_id == node->unichar_id)
+                t_begin_before += t_begin-1;
+              else
+                t_begin_before = -1;
+            }
+            std::tuple<NODE_REF, UNICHAR_ID, int> pos1(end, node->unichar_id, t_begin_before);
             dprintf("t %4d end %d, symbol %d=%s, hash %x, t %d", t_end, end, node->unichar_id,
                     charset->debug_str(node->unichar_id).string(), hash.first, t_begin);
             if (hashes.find(hash) != hashes.end()) {
               // we have already seen this node
               begin = hashes[hash];
+              predecessors[pos] = begin;
+              dprintf(" begin %d OLD\n", begin);
+            } else if (hashes.find(hash2) != hashes.end()) {
+              // we have already seen this node
+              begin = hashes[hash2];
+              predecessors[pos2] = begin;
               dprintf(" begin %d OLD\n", begin);
             } else if (predecessors.find(pos) != predecessors.end()) {
               // join paths, despite different hashes
@@ -218,22 +235,33 @@ void RecodeBeamSearch::Decode(const NetworkIO& output, double dict_ratio,
               // join paths, despite different hashes
               begin = predecessors[pos2];
               dprintf(" begin %d JOIN\n", begin);
+          // the following ensures that paths are ignored which would sub-divide an existing edge
+          // into 2 smaller successive edges with the same label
+          // this is merely a workaround against multi-timestep hypotheses intersected by competing nulls
+          // which are probably a deficiency of vanilla CTC (as opposed to Equal Spacing CTC etc)
+          // that cause "diplopia" in the result (duplicates in the decoded sequence without actual
+          // repetitions in the input), and are observed more likely on suboptimal paths and models
+          // (and thus unavoidable in a full lattice view)
+            } else if (predecessors.find(pos1) != predecessors.end()) {
+              // abandon path
+              dprintf(" IGNORE\n");
+              break;
             } else {
               // add node
               begin = lat.new_node();
               dprintf(" begin %d NEW\n", begin);
               hashes[hash] = begin;
+              predecessors[pos] = begin;
               if (ranks.find(t_begin) != ranks.end())
                 ranks[t_begin].push_back(begin);
               else
                 ranks[t_begin] = {begin};
-              printf("%d [label=\"\\N (t%d)\"];\n", begin, t_begin);
+              printf("%d [label=\"\\N (t=%d)\"];\n", begin, t_begin);
             }
             EDGE_REF edge = lat.edge_char_of(begin, end, node->unichar_id);
             if (edge == NO_EDGE) {
               if (!lat.add_new_edge(begin, end, node->unichar_id))
                 tprintf("Failed to add edge %d-%d [%d]\n", begin, end, node->unichar_id);
-              predecessors[pos] = begin;
               printf("%d -> %d [label=\"\\\"%s%s\\\"\"];\n",
                      begin, end,
                      !strcmp(charset->id_to_unichar_ext(node->unichar_id), "\"") ||
@@ -664,7 +692,8 @@ void RecodeBeamSearch::ComputeTopN(const float* outputs, int num_outputs,
   while (!top_heap_.empty()) {
     TopPair entry;
     top_heap_.Pop(&entry);
-    if (top_heap_.size() > 1) {
+    //if (top_heap_.size() > 1) {
+    if (top_heap_.size() > 10) { // increased beam input width for lattice output
       top_n_flags_[entry.data] = TN_TOPN;
     } else {
       top_n_flags_[entry.data] = TN_TOP2;
@@ -1168,6 +1197,21 @@ void RecodeBeamSearch::ExtractPath(
     node = node->prev;
   }
   path->reverse();
+}
+
+// Helper backtracks through the lattice from the given node, 
+// stopping at the next start of a character. Returns that node.
+const RecodeNode* RecodeBeamSearch::GetPrevStart(const RecodeNode* node, int* steps) {
+  int t = 0;
+  while (node->prev != nullptr &&
+         (node->duplicate ||
+          node->code == null_char_)) {
+    node = node->prev;
+    --t;
+  }
+  if (steps != nullptr)
+    *steps = t;
+  return node;
 }
 
 // Helper prints debug information on the given lattice path.
